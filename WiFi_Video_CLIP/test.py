@@ -1,3 +1,5 @@
+import os
+import sys
 import yaml
 import torch
 from torch.utils.data import DataLoader, random_split
@@ -5,6 +7,23 @@ from torch.utils.data import DataLoader, random_split
 from dataset.wimans_dataset import WiMANS_CLIP_Dataset
 from models.clip_model import WiMANS_CLIP
 from core.evaluate import evaluate_linear_probe
+
+# 双通道日志拦截器
+class Logger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+# 重定向测试日志
+os.makedirs("../result/clip", exist_ok=True)
+sys.stdout = Logger("../result/clip/testing_log.txt")
+
 
 def main():
     config_path = "configs/wimans_clip_config.yaml"
@@ -20,8 +39,8 @@ def main():
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
     
-    train_loader = DataLoader(train_dataset, batch_size=cfg['train']['batch_size'], shuffle=False, num_workers=cfg['train']['num_workers'])
-    val_loader = DataLoader(val_dataset, batch_size=cfg['train']['batch_size'], shuffle=False, num_workers=cfg['train']['num_workers'])
+    train_loader = DataLoader(train_dataset, batch_size=cfg['test']['batch_size'], shuffle=False, num_workers=cfg['test']['num_workers'])
+    val_loader = DataLoader(val_dataset, batch_size=cfg['test']['batch_size'], shuffle=False, num_workers=cfg['test']['num_workers'])
 
     # 2. 实例化模型并加载预训练权重
     model = WiMANS_CLIP(

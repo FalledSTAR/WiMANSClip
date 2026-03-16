@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from tqdm import tqdm
 
 @torch.no_grad()
@@ -36,55 +37,108 @@ def evaluate_retrieval(model, dataloader, device):
         "W2V_R5": calculate_recall(similarity.T, k=5)
     }
 
-def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=54, epochs=10):
+def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=54, epochs=50):
     """
-    WiFi 单模态线性探测 (带有详细输出日志)
+    WiFi 单模态端到端微调 (终极修正版)
     """
-    model.eval()
-    # 定义线性分类器
-    classifier = nn.Linear(model.wifi_encoder.projection.out_features, num_classes).to(device)
-    optimizer = optim.Adam(classifier.parameters(), lr=1e-3)
-    criterion = nn.BCEWithLogitsLoss()
+    print("\n[阶段 1/2] 准备全面微调 (Fine-tuning) 环境...")
     
-    # 带有进度条的特征提取辅助函数
-    @torch.no_grad()
-    def extract_features(dataloader, desc_text):
-        features, labels = [], []
-        loop = tqdm(dataloader, desc=desc_text)
-        for batch in loop:
-            _, wifi_feat, _ = model(video_inputs=batch["video"].to(device), wifi_inputs=batch["wifi"].to(device))
-            features.append(wifi_feat)
-            labels.append(batch["label"].view(-1, num_classes).to(device))
-        return torch.cat(features, dim=0), torch.cat(labels, dim=0)
+    # 1. 解除 WiFi 编码器的参数冻结
+    for param in model.wifi_encoder.parameters():
+        param.requires_grad = True
+        
+    # 2. 【核心重构】：引入多头解码器 (Multi-Head Decoder)
+    class MultiHeadClassifier(nn.Module):
+        def __init__(self, in_features, num_users=6, actions_per_user=9):
+            super().__init__()
+            # 创建 6 个独立的物理分支，每个分支专注解码 1 个用户的 9 种动作
+            self.heads = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(in_features, 256),
+                    nn.BatchNorm1d(256),
+                    nn.ReLU(),
+                    nn.Dropout(0.3),
+                    nn.Linear(256, actions_per_user)
+                ) for _ in range(num_users)
+            ])
+            
+        def forward(self, x):
+            # 将 6 个头的输出 (每个是 [Batch, 9]) 在最后一个维度拼接成 [Batch, 54]
+            return torch.cat([head(x) for head in self.heads], dim=-1)
 
-    print("\n[阶段 1/3] 正在通过冻结的 WiFi 编码器提取特征...")
-    train_features, train_labels = extract_features(train_loader, "提取训练集特征")
-    test_features, test_labels = extract_features(test_loader, "提取测试集/验证集特征")
+    classifier = MultiHeadClassifier(model.wifi_encoder.projection.out_features).to(device)
     
-    print(f"\n[阶段 2/3] 训练外挂线性分类器 (总 Epochs: {epochs})...")
-    classifier.train()
+    # 3. 优化器配置
+    optimizer = optim.Adam([
+        {'params': model.wifi_encoder.parameters(), 'lr': 1e-4}, 
+        {'params': classifier.parameters(), 'lr': 1e-3}
+    ])
+    
+    # 【降低惩罚】：既然有了多头机制增强表达力，将过于极端的 20 倍惩罚降回 5 倍，防止模型乱开火
+    pos_weight = torch.ones([num_classes]).to(device) * 5.0
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    print(f"\n[阶段 2/2] 启动端到端微调 (总 Epochs: {epochs})...")
+    
     for epoch in range(epochs):
-        optimizer.zero_grad()
+        model.wifi_encoder.train()
+        classifier.train()
+        total_train_loss = 0.0
         
-        # 前向传播与计算 Loss
-        logits = classifier(train_features)
-        loss = criterion(logits, train_labels)
+        loop = tqdm(train_loader, desc=f"Epoch [{epoch+1:02d}/{epochs}] Training", leave=False)
+        for batch in loop:
+            wifi_inputs = batch["wifi"].to(device)
+            labels = batch["label"].view(-1, num_classes).to(device)
+            
+            optimizer.zero_grad()
+            
+            # 【修复3】直接使用原始特征 raw_feat，彻底去除 F.normalize 束缚
+            raw_feat = model.wifi_encoder(wifi_inputs)
+            logits = classifier(raw_feat)
+            
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            
+            total_train_loss += loss.item()
+            
+        avg_loss = total_train_loss / len(train_loader)
         
-        # 反向传播与优化
-        loss.backward()
-        optimizer.step()
+        # --- 验证阶段 ---
+        model.wifi_encoder.eval()
+        classifier.eval()
         
-        # 实时输出当前 Epoch 的分类 Loss
-        print(f"  -> Linear Probe Epoch [{epoch+1}/{epochs}] | BCE Loss: {loss.item():.4f}")
+        all_preds, all_labels = [], []
+        max_probs = [] # 【新增】记录模型给出的最大概率
         
-    print("\n[阶段 3/3] 在测试集上评估最终准确率...")
-    classifier.eval()
-    with torch.no_grad():
-        test_logits = classifier(test_features)
-        predictions = (torch.sigmoid(test_logits) > 0.5).float()
+        with torch.no_grad():
+            for batch in test_loader:
+                wifi_inputs = batch["wifi"].to(device)
+                labels = batch["label"].view(-1, num_classes).to(device)
+                
+                raw_feat = model.wifi_encoder(wifi_inputs)
+                logits = classifier(raw_feat)
+                probs = torch.sigmoid(logits)
+                
+                max_probs.append(probs.max().item()) # 记录这一批次的最大预测概率
+                preds = (probs > 0.5).float()
+                
+                all_preds.append(preds)
+                all_labels.append(labels)
+                
+        full_preds = torch.cat(all_preds, dim=0).view(-1, 9)
+        full_labels = torch.cat(all_labels, dim=0).view(-1, 9)
         
-        # 计算 54 维多标签全部匹配正确的严格准确率
-        correct = (predictions == test_labels).all(dim=1).sum().item()
-        accuracy = correct / test_labels.size(0)
+        correct_all = (full_preds == full_labels).all(dim=1)
+        acc_all = correct_all.sum().item() / full_labels.size(0)
         
-    return accuracy
+        active_mask = full_labels.sum(dim=1) > 0
+        if active_mask.sum().item() > 0:
+            acc_active = correct_all[active_mask].sum().item() / active_mask.sum().item()
+        else:
+            acc_active = 0.0
+            
+        current_max_prob = max(max_probs) if max_probs else 0.0
+        print(f"  -> Finetune Epoch [{epoch+1:02d}/{epochs}] | Loss: {avg_loss:.4f} | 总准确率: {acc_all * 100:.2f}% | 真实动作准确率: {acc_active * 100:.2f}% | 模型输出最高概率: {current_max_prob:.2f}")
+    
+    return acc_all

@@ -9,11 +9,20 @@ def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, devic
     top_k = cfg.get('train', {}).get('save_top_k', 3)
     
     # 【新增】梯度累加步数，默认设为 4。相当于有效 Batch Size = BS * steps，适合显存受限的情况。
-    accumulation_steps = cfg.get('train', {}).get('accumulation_steps', 8) 
+    accumulation_steps = cfg.get('train', {}).get('accumulation_steps', 1) 
     
     os.makedirs(save_dir, exist_ok=True)
     saved_models = [] 
 
+    # =====================================================================
+    # 定义余弦退火学习率调度器
+    # T_max 设置为总 epochs，eta_min 为学习率衰减的下限
+    # =====================================================================
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=epochs, 
+        eta_min=5e-5
+    )
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
@@ -45,8 +54,11 @@ def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, devic
             # 实时动态打印日志
             if (i + 1) % log_interval == 0 or (i + 1) == len(train_loader):
                 print(f"Epoch [{epoch+1}/{epochs}] | Step [{i+1}/{len(train_loader)}] | Loss: {real_loss:.4f} | Temp: {logit_scale.item():.2f}")
-            
-        print(f"\n---> Epoch {epoch+1} 结束 | 平均训练 Loss: {total_loss / len(train_loader):.4f}")
+        
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"\n---> Epoch {epoch+1} 结束 | 平均训练 Loss: {total_loss / len(train_loader):.4f} | 当前学习率: {current_lr:.6f}")    
+
 
         # --- 验证阶段 ---
         retrieval_metrics = evaluate_retrieval(model, val_loader, device)

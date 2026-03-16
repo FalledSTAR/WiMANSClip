@@ -1,3 +1,5 @@
+import os
+import sys
 import yaml
 import torch
 import torch.optim as optim
@@ -7,6 +9,22 @@ from dataset.wimans_dataset import WiMANS_CLIP_Dataset
 from models.clip_model import WiMANS_CLIP
 from core.loss import CLIPLoss
 from train import train_loop
+
+# 双通道日志拦截器
+class Logger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+# 在文件加载后立即重定向输出
+os.makedirs("../result/clip", exist_ok=True)
+sys.stdout = Logger("../result/clip/training_log.txt")
 
 def main():
     config_path = "./configs/wimans_clip_config.yaml"
