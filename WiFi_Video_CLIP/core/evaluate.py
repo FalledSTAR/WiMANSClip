@@ -3,6 +3,12 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import os
+from datetime import datetime
+from torch.utils.data import TensorDataset, DataLoader
+
+
+def _now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 @torch.no_grad()
 def evaluate_retrieval(model, dataloader, device):
@@ -19,25 +25,22 @@ def evaluate_retrieval(model, dataloader, device):
         all_video_features.append(video_features)
         all_wifi_features.append(wifi_features)
         
-    V = torch.cat(all_video_features, dim=0) # 形状: [N, Time_v, 512]
-    W = torch.cat(all_wifi_features, dim=0)  # 形状: [N, Time_w, 512]
+    V = torch.cat(all_video_features, dim=0) # [N, Time_v, 512]
+    W = torch.cat(all_wifi_features, dim=0)  # [N, Time_w, 512]
     N_samples = V.shape[0]
 
     # 1. 计算细粒度交叉相似度矩阵
-    # 结果矩阵 sim 形状: [N, N, Time_v, Time_w]
-    # 注意: N=377 时，这步会瞬时占用约 1.5GB 显存，一般显卡可轻松承受
     sim = torch.einsum('imd,jnd->ijmn', V, W)
     
     # 2. V2W 局部对齐 (视频找WiFi)
-    sim_v2w, _ = sim.max(dim=3)     # 取 WiFi 时间步上的最大值: [N, N, Time_v]
-    sim_v2w = sim_v2w.mean(dim=2)   # 对视频时间步取平均: [N, N]
+    sim_v2w, _ = sim.max(dim=3)     
+    sim_v2w = sim_v2w.mean(dim=2)   
     
     # 3. W2V 局部对齐 (WiFi找视频)
-    sim_w2v, _ = sim.max(dim=2)     # 取视频时间步上的最大值: [N, N, Time_w]
-    sim_w2v = sim_w2v.mean(dim=2)   # 对 WiFi 时间步取平均: [N, N]
+    sim_w2v, _ = sim.max(dim=2)     
+    sim_w2v = sim_w2v.mean(dim=2)   
     
-    # 4. 融合得到全局相似度矩阵
-    similarity = (sim_v2w + sim_w2v) / 2.0 # 形状: [N, N]
+    similarity = (sim_v2w + sim_w2v) / 2.0 
 
     def calculate_recall(sim_matrix, k=1):
         _, topk_indices = sim_matrix.topk(k, dim=1)
@@ -55,28 +58,20 @@ def evaluate_retrieval(model, dataloader, device):
 def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=54, epochs=80):
     """
     WiFi 单模态端到端微调 
-    (修复：真实样本ID溯源 + 树状文件导出 + Argmax 最高概率评估)
+    (引入预提取特征缓存技术，实现百倍极速加速)
     """
-    print("\n[阶段 1/2] 准备极速线性探测 (Fast Linear Probing) 环境...")
+    print(f"\n[{_now_str()}] [阶段 1/3] 准备极速线性探测 (Fast Linear Probing) 环境...")
     
     # 彻底冻结 WiFi 编码器，将其变为纯粹的特征提取器
     for param in model.wifi_encoder.parameters():
         param.requires_grad = False
         
-    # 2. 【核心重构】：引入 DETR 风格的 Slot Attention (槽位交叉注意力机制)
     class SlotAttentionClassifier(nn.Module):
         def __init__(self, in_features, num_users=6, actions_per_user=9):
             super().__init__()
             self.num_users = num_users
-            
-            # 【神级组件 1】：6 个可学习的查询向量 (Learnable Queries)，代表 6 个物理坑位
             self.query_embed = nn.Parameter(torch.randn(1, num_users, in_features))
-            
-            # 【神级组件 2】：交叉注意力机制 (Cross-Attention)
-            # 让 6 个 Query 去 150 帧的特征序列中，主动提取属于自己的动作信息
             self.cross_attn = nn.MultiheadAttention(embed_dim=in_features, num_heads=8, batch_first=True, dropout=0.1)
-            
-            # 归一化与前馈网络 (标准的 Transformer Decoder 结构)
             self.norm1 = nn.LayerNorm(in_features)
             self.norm2 = nn.LayerNorm(in_features)
             self.ffn = nn.Sequential(
@@ -85,8 +80,6 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
                 nn.Dropout(0.2),
                 nn.Linear(in_features * 2, in_features)
             )
-            
-            # 6 个物理分支，独立解码用户槽位
             self.heads = nn.ModuleList([
                 nn.Sequential(
                     nn.Linear(in_features, 256),
@@ -98,55 +91,75 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
             ])
             
         def forward(self, x):
-            # x 的输入形状: [Batch, 150, 512] (预训练提取的 WiFi 序列特征)
             B = x.size(0)
-            
-            # 1. 将 6 个 Query 扩展到当前 Batch -> [Batch, 6, 512]
             queries = self.query_embed.expand(B, -1, -1)
-            
-            # 2. Cross-Attention 分离特征
-            # Query=吸盘(6个), Key/Value=特征序列(150帧)
-            # 输出 attn_out 形状: [Batch, 6, 512]
             attn_out, _ = self.cross_attn(query=queries, key=x, value=x)
-            
-            # 3. 残差连接与 FFN
             out = self.norm1(queries + attn_out)
-            out = self.norm2(out + self.ffn(out)) # [Batch, 6, 512]
-            
-            # 4. 解耦后的特征送入独立的分类头
+            out = self.norm2(out + self.ffn(out)) 
             logits = []
             for i in range(self.num_users):
-                slot_feat = out[:, i, :] # 精确提取第 i 个人的独立特征: [Batch, 512]
-                logits.append(self.heads[i](slot_feat)) # [Batch, 9]
-                
-            return torch.cat(logits, dim=-1) # [Batch, 54]
+                slot_feat = out[:, i, :] 
+                logits.append(self.heads[i](slot_feat)) 
+            return torch.cat(logits, dim=-1) 
 
     classifier = SlotAttentionClassifier(model.wifi_encoder.projection.out_features).to(device)
-    
     optimizer = optim.Adam(classifier.parameters(), lr=1e-3)
-    
     pos_weight = torch.ones([num_classes]).to(device) * 5.0
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     export_dir = "../result/clip/predictions"
     os.makedirs(export_dir, exist_ok=True)
 
-    print(f"\n[阶段 2/2] 启动端到端微调 (总 Epochs: {epochs})...")
+    # ==========================================================
+    # 【核心加速引擎】：预提取特征缓存 (Feature Caching)
+    # ==========================================================
+    print(f"\n[{_now_str()}] [阶段 2/3] 预提取并缓存骨干网络特征 (只需执行 1 次)...")
+    model.wifi_encoder.eval()
+    
+    train_feat_list, train_label_list = [], []
+    with torch.no_grad():
+        for batch in train_loader:
+            wifi_inputs = batch["wifi"].to(device)
+            labels = batch["label"].view(-1, num_classes).to(device)
+            raw_feat = model.wifi_encoder(wifi_inputs)
+            # 存入 CPU 内存，彻底释放显存并切断硬盘 IO
+            train_feat_list.append(raw_feat.cpu())
+            train_label_list.append(labels.cpu())
+            
+    # 重新构建极速 DataLoader
+    train_dataset_cached = TensorDataset(torch.cat(train_feat_list, dim=0), torch.cat(train_label_list, dim=0))
+    cached_train_loader = DataLoader(train_dataset_cached, batch_size=train_loader.batch_size, shuffle=True)
+
+    test_feat_list, test_label_list = [], []
+    all_sample_ids = []
+    with torch.no_grad():
+        for batch in test_loader:
+            wifi_inputs = batch["wifi"].to(device)
+            labels = batch["label"].to(device) 
+            raw_feat = model.wifi_encoder(wifi_inputs)
+            test_feat_list.append(raw_feat.cpu())
+            test_label_list.append(labels.cpu())
+            all_sample_ids.extend(batch["sample_id"])
+            
+    test_dataset_cached = TensorDataset(torch.cat(test_feat_list, dim=0), torch.cat(test_label_list, dim=0))
+    cached_test_loader = DataLoader(test_dataset_cached, batch_size=test_loader.batch_size, shuffle=False)
+    
+    print(f"\n[{_now_str()}] [阶段 3/3] 启动全速微调 (总 Epochs: {epochs})...")
     log_interval = 20
 
+    # ==========================================================
+    # 极速训练循环 (直接读取缓存特征，不再经过 Encoder)
+    # ==========================================================
     for epoch in range(epochs):
-        model.wifi_encoder.train()
         classifier.train()
         total_train_loss = 0.0
         
-        for i, batch in enumerate(train_loader):
-            wifi_inputs = batch["wifi"].to(device)
-            # 训练时依然拍平为 54 维计算整体 BCE 损失
-            labels = batch["label"].view(-1, num_classes).to(device)
+        for i, (cached_feat, labels) in enumerate(cached_train_loader):
+            cached_feat = cached_feat.to(device)
+            labels = labels.to(device)
             
             optimizer.zero_grad()
-            raw_feat = model.wifi_encoder(wifi_inputs)
-            logits = classifier(raw_feat)
+            logits = classifier(cached_feat)
             
             loss = criterion(logits, labels)
             loss.backward()
@@ -154,55 +167,38 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
             
             total_train_loss += loss.item()
             
-            if (i + 1) % log_interval == 0 or (i + 1) == len(train_loader):
-                print(f"  -> Epoch [{epoch+1:02d}/{epochs}] | Step [{i+1:02d}/{len(train_loader)}] | 当前 Batch Loss: {loss.item():.4f}")
+            if (i + 1) % log_interval == 0 or (i + 1) == len(cached_train_loader):
+                print(f"[{_now_str()}]   -> Epoch [{epoch+1:02d}/{epochs}] | Step [{i+1:02d}/{len(cached_train_loader)}] | 当前 Batch Loss: {loss.item():.4f}")
                 
-        avg_loss = total_train_loss / len(train_loader)
+        avg_loss = total_train_loss / len(cached_train_loader)
         
         # --- 验证阶段 ---
-        model.wifi_encoder.eval()
         classifier.eval()
         all_preds_logits, all_labels = [], []
-        all_sample_ids = []
         
         with torch.no_grad():
-            for batch in test_loader:
-                sample_ids = batch["sample_id"]
-                wifi_inputs = batch["wifi"].to(device)
-                labels = batch["label"].to(device) # 形状: [Batch, 6, 9]
+            for cached_feat, labels in cached_test_loader:
+                cached_feat = cached_feat.to(device)
                 
-                raw_feat = model.wifi_encoder(wifi_inputs)
-                logits = classifier(raw_feat)      # 形状: [Batch, 54]
-                logits = logits.view(-1, 6, 9)     # 还原为: [Batch, 6, 9]
+                logits = classifier(cached_feat)      
+                logits = logits.view(-1, 6, 9)     
                 
-                all_sample_ids.extend(sample_ids)
-                all_preds_logits.append(logits)
-                all_labels.append(labels)
+                all_preds_logits.append(logits.cpu())
+                all_labels.append(labels.cpu())
                 
-        full_logits = torch.cat(all_preds_logits, dim=0) # [N, 6, 9]
-        full_labels = torch.cat(all_labels, dim=0)       # [N, 6, 9]
+        full_logits = torch.cat(all_preds_logits, dim=0) 
+        full_labels = torch.cat(all_labels, dim=0)       
         
-        # ==========================================
-        # 【终极修正】：阈值门控的 Argmax (Threshold-Gated Argmax)
-        # ==========================================
-        probs = torch.sigmoid(full_logits) # 将 Logits 转为 0~1 的概率
+        # 阈值门控的 Argmax (Threshold-Gated Argmax)
+        probs = torch.sigmoid(full_logits) 
+        max_probs, pred_indices = torch.max(probs, dim=2) 
         
-        # 1. 找到每个用户槽位的最高概率及其对应的动作索引
-        max_probs, pred_indices = torch.max(probs, dim=2) # [N, 6]
-        
-        # 2. 生成基础的 Argmax One-Hot 矩阵
         pred_argmax_onehot = torch.zeros_like(full_logits)
         pred_argmax_onehot.scatter_(2, pred_indices.unsqueeze(-1), 1)
-        
-        # 3. 生成有效性掩码：只有最高概率突破 0.5 的槽位，才被认为“有人做动作”
-        valid_mask = max_probs > 0.5 # [N, 6]
-        
-        # 4. 将掩码应用到 Argmax 矩阵上 (没突破阈值的槽位将被强制归零)
+        valid_mask = max_probs > 0.5 
         pred_onehot = pred_argmax_onehot * valid_mask.unsqueeze(-1).float()
         
-        # ==========================================
-        # 导出真值与预测结果 (层级结构 + 真实 ID)
-        # ==========================================
+        # 导出文件逻辑
         if epoch == 0:
             gt_path = os.path.join(export_dir, "ground_truth.txt")
             with open(gt_path, "w") as f:
@@ -225,21 +221,51 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
                         f.write(f"  User_{u+1}: {pred_onehot[idx, u].int().tolist()}\n")
                     f.write("\n")
 
-        # ==========================================
-        # 指标计算：仅计算真实发生的动作的 Top-1 准确率
-        # ==========================================
-        # 将张量展平计算
+        # 指标计算：全维度透明评估
         pred_flat = pred_onehot.view(-1, 9)
         labels_flat = full_labels.view(-1, 9)
         
         correct_all = (pred_flat == labels_flat).all(dim=1)
-        active_mask = labels_flat.sum(dim=1) > 0 
+        active_mask = labels_flat.sum(dim=1) > 0   
+        empty_mask = ~active_mask                  
         
         if active_mask.sum().item() > 0:
             acc_active = correct_all[active_mask].sum().item() / active_mask.sum().item()
         else:
             acc_active = 0.0
             
-        print(f"==> Epoch [{epoch+1:02d}/{epochs}] 总结 | 平均 Loss: {avg_loss:.4f} | 真实动作准确率: {acc_active * 100:.2f}%\n")
+        if empty_mask.sum().item() > 0:
+            acc_empty = correct_all[empty_mask].sum().item() / empty_mask.sum().item()
+        else:
+            acc_empty = 0.0
+            
+        acc_total = correct_all.sum().item() / labels_flat.size(0)
+
+        # ==========================================
+        # 【新增】：计算房间级/无序动作召回率 (Room-Level Recall)
+        # ==========================================
+        # 1. 房间级别的真实动作集合 (只要房间里有人做某动作，对应动作位就为 True)
+        # full_labels 形状: [N, 6, 9] -> room_labels 形状: [N, 9]
+        room_labels = full_labels.sum(dim=1) > 0 
+        
+        # 2. 房间级别的预测动作集合
+        # pred_onehot 形状: [N, 6, 9] -> room_preds 形状: [N, 9]
+        room_preds = pred_onehot.sum(dim=1) > 0 
+        
+        # 3. 计算有动作发生的房间的召回率
+        room_active_mask = room_labels.sum(dim=1) > 0 # 筛选出确实有动作的房间 [N]
+        
+        if room_active_mask.sum().item() > 0:
+            # 在有动作的房间中，预测出的动作集合完全覆盖/等同于真实动作集合的比例
+            correct_rooms = (room_preds == room_labels).all(dim=1)
+            room_recall = correct_rooms[room_active_mask].sum().item() / room_active_mask.sum().item()
+        else:
+            room_recall = 0.0
+
+        print(f"[{_now_str()}] ==> Epoch [{epoch+1:02d}/{epochs}] 总结 | 平均 Loss: {avg_loss:.4f} | "
+              f"全局总准确率: {acc_total * 100:.2f}% | "
+              f"真实动作准确率(严苛): {acc_active * 100:.2f}% | "
+              f"静默抑制准确率: {acc_empty * 100:.2f}% | "
+              f"【核心验证】房间级无序动作命中率: {room_recall * 100:.2f}%\n")
     
     return acc_active

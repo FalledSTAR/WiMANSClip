@@ -64,7 +64,6 @@ def main():
         num_classes=54, # 6 用户 x 9 动作
         epochs=cfg['test']['linear_probe_epochs']
     )
-    print(f"最终评估 -> WiFi 单模态多用户准确率: {probe_acc * 100:.2f}%")
 
 if __name__ == "__main__":
     main()

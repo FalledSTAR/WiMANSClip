@@ -1,6 +1,6 @@
 import os
 import torch
-from tqdm import tqdm
+from datetime import datetime  # 【新增】引入时间戳模块
 from core.evaluate import evaluate_retrieval
 
 def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, device):
@@ -53,18 +53,20 @@ def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, devic
             
             # 实时动态打印日志
             if (i + 1) % log_interval == 0 or (i + 1) == len(train_loader):
-                print(f"Epoch [{epoch+1}/{epochs}] | Step [{i+1}/{len(train_loader)}] | Loss: {real_loss:.4f} | Temp: {logit_scale.item():.2f}")
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{current_time}] Epoch [{epoch+1}/{epochs}] | Step [{i+1}/{len(train_loader)}] | Loss: {real_loss:.4f} | Temp: {logit_scale.item():.2f}")
         
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
-        print(f"\n---> Epoch {epoch+1} 结束 | 平均训练 Loss: {total_loss / len(train_loader):.4f} | 当前学习率: {current_lr:.6f}")    
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n[{current_time}] ---> Epoch {epoch+1} 结束 | 平均训练 Loss: {total_loss / len(train_loader):.4f} | 当前学习率: {current_lr:.6f}")   
 
 
         # --- 验证阶段 ---
         retrieval_metrics = evaluate_retrieval(model, val_loader, device)
- 
-        print(f"Retrieval - V2W R@1: {retrieval_metrics['V2W_R1']:.4f}, W2V R@1: {retrieval_metrics['W2V_R1']:.4f}")
-        print(f"Retrieval - V2W R@5: {retrieval_metrics['V2W_R5']:.4f}, W2V R@5: {retrieval_metrics['W2V_R5']:.4f}")
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{current_time}] Retrieval - V2W R@1: {retrieval_metrics['V2W_R1']:.4f}, W2V R@1: {retrieval_metrics['W2V_R1']:.4f}")
+        print(f"[{current_time}] Retrieval - V2W R@5: {retrieval_metrics['V2W_R5']:.4f}, W2V R@5: {retrieval_metrics['W2V_R5']:.4f}")
 
         # --- Top-K 保存逻辑 ---
         current_v2w = retrieval_metrics['V2W_R1']
@@ -77,10 +79,9 @@ def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, devic
             worst_v2w, worst_w2v, _ = saved_models[-1]
             should_save = current_v2w > worst_v2w and current_w2v > worst_w2v
             if not should_save:
-                print(
-                    f"-> 未进入 Top-{top_k}: 需同时超过队尾模型 | "
-                    f"当前 V2W={current_v2w:.4f}, W2V={current_w2v:.4f} | "
-                    f"队尾 V2W={worst_v2w:.4f}, W2V={worst_w2v:.4f}"
+                print(f"[{current_time}] -> 未进入 Top-{top_k}: 需同时超过队尾模型 | "
+                      f"当前 V2W={current_v2w:.4f}, W2V={current_w2v:.4f} | "
+                      f"队尾 V2W={worst_v2w:.4f}, W2V={worst_w2v:.4f}"
                 )
 
         if should_save:
@@ -96,5 +97,7 @@ def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, devic
                 _, _, path_to_remove = saved_models.pop()
                 if os.path.exists(path_to_remove):
                     os.remove(path_to_remove)
-                print(f"-> 已替换并移除旧模型: {os.path.basename(path_to_remove)}")
-            print(f"-> 模型已保存入 Top-{top_k} 队列: {filename}")
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{current_time}] -> 已替换并移除旧模型: {os.path.basename(path_to_remove)}")
+            
+            print(f"[{current_time}] -> 模型已保存入 Top-{top_k} 队列: {filename}")
