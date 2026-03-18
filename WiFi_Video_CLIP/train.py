@@ -62,21 +62,39 @@ def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, devic
 
         # --- 验证阶段 ---
         retrieval_metrics = evaluate_retrieval(model, val_loader, device)
-        current_metric = retrieval_metrics['V2W_R1']
-        print(f"Retrieval - V2W R@1: {current_metric:.4f}, W2V R@1: {retrieval_metrics['W2V_R1']:.4f}")
+ 
+        print(f"Retrieval - V2W R@1: {retrieval_metrics['V2W_R1']:.4f}, W2V R@1: {retrieval_metrics['W2V_R1']:.4f}")
+        print(f"Retrieval - V2W R@5: {retrieval_metrics['V2W_R5']:.4f}, W2V R@5: {retrieval_metrics['W2V_R5']:.4f}")
 
         # --- Top-K 保存逻辑 ---
-        if len(saved_models) < top_k or current_metric > saved_models[-1][0]:
-            filename = f"clip_epoch_{epoch+1}_v2w_{current_metric:.4f}.pth"
+        current_v2w = retrieval_metrics['V2W_R1']
+        current_w2v = retrieval_metrics['W2V_R1']
+
+        should_save = False
+        if len(saved_models) < top_k:
+            should_save = True
+        else:
+            worst_v2w, worst_w2v, _ = saved_models[-1]
+            should_save = current_v2w > worst_v2w and current_w2v > worst_w2v
+            if not should_save:
+                print(
+                    f"-> 未进入 Top-{top_k}: 需同时超过队尾模型 | "
+                    f"当前 V2W={current_v2w:.4f}, W2V={current_w2v:.4f} | "
+                    f"队尾 V2W={worst_v2w:.4f}, W2V={worst_w2v:.4f}"
+                )
+
+        if should_save:
+            filename = f"clip_epoch_{epoch+1}_v2w_{current_v2w:.4f}_w2v_{current_w2v:.4f}.pth"
             save_path = os.path.join(save_dir, filename)
             
             torch.save(model.state_dict(), save_path)
-            saved_models.append((current_metric, save_path))
+            saved_models.append((current_v2w, current_w2v, save_path))
             
-            saved_models.sort(key=lambda x: x[0], reverse=True) 
+            saved_models.sort(key=lambda x: (x[0], x[1]), reverse=True)
             
             if len(saved_models) > top_k:
-                _, path_to_remove = saved_models.pop()
+                _, _, path_to_remove = saved_models.pop()
                 if os.path.exists(path_to_remove):
                     os.remove(path_to_remove)
+                print(f"-> 已替换并移除旧模型: {os.path.basename(path_to_remove)}")
             print(f"-> 模型已保存入 Top-{top_k} 队列: {filename}")

@@ -86,6 +86,7 @@ class WiMANS_CLIP_Dataset(Dataset):
         wifi_tensor = torch.tensor(data_csi, dtype=torch.float32)
 
         return {
+            "sample_id": sample_id,  # 返回真实的样本名称，如 act_x_x
             "video": video_tensor, 
             "wifi": wifi_tensor,
             "label": label_matrix  # 输出形状为 [6, 9] 的真实标注矩阵

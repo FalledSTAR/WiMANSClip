@@ -38,7 +38,7 @@ train:
 
 test:
   # 测试时去 result 文件夹读取你指定的具体模型
-  weight_path: "../result/clip/clip_epoch_95_v2w_0.2732.pth"
+  weight_path: "../result/clip/clip_epoch_100_v2w_0.2918.pth"
   linear_probe_epochs: 80
   batch_size: 32
   num_workers: 4
