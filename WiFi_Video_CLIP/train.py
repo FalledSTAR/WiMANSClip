@@ -1,6 +1,6 @@
 import os
 import torch
-from datetime import datetime  # 【新增】引入时间戳模块
+from datetime import datetime  
 from core.evaluate import evaluate_retrieval
 
 def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, device):
@@ -8,61 +8,68 @@ def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, devic
     save_dir = cfg['train']['save_dir']
     top_k = cfg.get('train', {}).get('save_top_k', 3)
     
-    # 【新增】梯度累加步数，默认设为 4。相当于有效 Batch Size = BS * steps，适合显存受限的情况。
     accumulation_steps = cfg.get('train', {}).get('accumulation_steps', 1) 
     
     os.makedirs(save_dir, exist_ok=True)
     saved_models = [] 
 
-    # =====================================================================
-    # 定义余弦退火学习率调度器
-    # T_max 设置为总 epochs，eta_min 为学习率衰减的下限
-    # =====================================================================
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, 
         T_max=epochs, 
         eta_min=5e-5
     )
+    
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
         optimizer.zero_grad()
         
-        # 设定每隔多少步打印一次信息 (比如每 20 步)
         log_interval = 20
         
         for i, batch in enumerate(train_loader):
             video_inputs = batch["video"].to(device)
             wifi_inputs = batch["wifi"].to(device)
             
-            video_features, wifi_features, logit_scale = model(video_inputs, wifi_inputs)
+            # 1. 提取原始标签矩阵，形状: [Batch, 6, 9]
+            action_labels = batch["label"].to(device) 
             
-            # 计算损失并除以累加步数
-            loss = criterion(video_features, wifi_features, logit_scale)
+            # 2. 【核心逻辑】：聚合为场景级多标签 (Scene-level Multi-hot)
+            # 只要房间内有任何一个用户在做该动作，该动作位置的值就设为 1
+            # 形状变为: [Batch, 9]
+            scene_labels = torch.clamp(torch.sum(action_labels, dim=1), max=1.0)
+            
+            # 3. 前向传播并获取 4 个返回值
+            video_features, wifi_features, logit_scale, wifi_logits = model(
+                video_inputs, wifi_inputs, return_logits=True
+            )
+            
+            # 4. 传入压缩后的 scene_labels 计算联合 Loss
+            loss, loss_nce, loss_ce = criterion(
+                video_features, wifi_features, logit_scale, wifi_logits, scene_labels
+            )
+            
             loss = loss / accumulation_steps
             loss.backward()
             
-            # 梯度累加与参数更新
             if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
                 optimizer.step()
                 optimizer.zero_grad()
             
-            # 记录真实的 batch loss
             real_loss = loss.item() * accumulation_steps
             total_loss += real_loss
             
-            # 实时动态打印日志
             if (i + 1) % log_interval == 0 or (i + 1) == len(train_loader):
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{current_time}] Epoch [{epoch+1}/{epochs}] | Step [{i+1}/{len(train_loader)}] | Loss: {real_loss:.4f} | Temp: {logit_scale.item():.2f}")
+                print(f"[{current_time}] Epoch [{epoch+1}/{epochs}] | Step [{i+1}/{len(train_loader)}] "
+                      f"| Total Loss: {real_loss:.4f} (NCE:{loss_nce.item():.4f}, CE:{loss_ce.item():.4f}) "
+                      f"| Temp: {logit_scale.item():.2f}")
         
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"\n[{current_time}] ---> Epoch {epoch+1} 结束 | 平均训练 Loss: {total_loss / len(train_loader):.4f} | 当前学习率: {current_lr:.6f}")   
 
-
-        # --- 验证阶段 ---
+        # --- 验证阶段 --- (无需修改 evaluate 脚本，它默认调用的 return_logits=False)
         retrieval_metrics = evaluate_retrieval(model, val_loader, device)
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{current_time}] Retrieval - V2W R@1: {retrieval_metrics['V2W_R1']:.4f}, W2V R@1: {retrieval_metrics['W2V_R1']:.4f}")
