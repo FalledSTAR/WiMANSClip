@@ -59,17 +59,15 @@ class THAT_EncoderLayer(nn.Module):
         return var_s + var_t
 
 class THAT_Encoder(nn.Module):
-    def __init__(self, projection_dim=512, time_steps=3000, features=270):
+    # 【新增参数】：num_classes (分类数)，如果提供则初始化分类头
+    def __init__(self, projection_dim=512, time_steps=3000, features=270, num_classes=None):
         super(THAT_Encoder, self).__init__()
         # ------------------- Left Branch -------------------
         self.layer_left_pooling = nn.AvgPool1d(kernel_size=20, stride=20)
         self.layer_left_gaussian = Gaussian_Position(features, time_steps // 20)
         self.layer_left_encoder = nn.ModuleList([THAT_EncoderLayer(features, 10, [1, 3, 5]) for _ in range(4)])
         self.layer_left_norm = nn.LayerNorm(features, eps=1e-6)
-        self.layer_left_cnn_0 = nn.Conv1d(features, 128, kernel_size=8)
-        self.layer_left_cnn_1 = nn.Conv1d(features, 128, kernel_size=16)
-
-        # 【修改 1】：添加 padding="same"
+        
         self.layer_left_cnn_0 = nn.Conv1d(features, 128, kernel_size=8, padding="same")
         self.layer_left_cnn_1 = nn.Conv1d(features, 128, kernel_size=16, padding="same")
         self.layer_left_dropout = nn.Dropout(0.5)
@@ -84,11 +82,16 @@ class THAT_Encoder(nn.Module):
         self.layer_right_dropout = nn.Dropout(0.5)
         
         self.layer_leakyrelu = nn.LeakyReLU()
-        # 原特征融合维度 288 -> 投影到联合空间
+        
+        # 投影到联合空间
         self.projection = nn.Linear(288, projection_dim)
+        
+        # 【新增】：辅助分类头 (Auxiliary Classification Head)
+        self.num_classes = num_classes
+        if self.num_classes is not None:
+            self.classifier = nn.Linear(projection_dim, num_classes)
 
-    def forward(self, x):
-        # 展平输入空间维度: [Batch, 3000, 3, 3, 30] -> [Batch, 3000, 270]
+    def forward(self, x, return_logits=False):
         if x.dim() == 5:
             x = x.view(x.size(0), x.size(1), -1)
             
@@ -103,10 +106,9 @@ class THAT_Encoder(nn.Module):
         var_left = self.layer_left_norm(var_left)
         var_left = torch.permute(var_left, (0, 2, 1))
         
-        # 左支路提取时间序列特征: [Batch, 128, 150]
         var_left_0 = self.layer_leakyrelu(self.layer_left_cnn_0(var_left))
         var_left_1 = self.layer_leakyrelu(self.layer_left_cnn_1(var_left))
-        var_left = self.layer_left_dropout(torch.cat([var_left_0, var_left_1], dim=1)) # [Batch, 256, 150]
+        var_left = self.layer_left_dropout(torch.cat([var_left_0, var_left_1], dim=1))
         
         # --- Right ---
         var_right = torch.permute(var_t, (0, 2, 1))
@@ -115,27 +117,26 @@ class THAT_Encoder(nn.Module):
         var_right = self.layer_right_norm(var_right)
         var_right = torch.permute(var_right, (0, 2, 1))
         
-        # 右支路提取频率序列特征: [Batch, 16, 270]
         var_right_0 = self.layer_leakyrelu(self.layer_right_cnn_0(var_right))
         var_right_1 = self.layer_leakyrelu(self.layer_right_cnn_1(var_right))
         
-        # 【核心修正】：将频率维度(270)求和，提取全局频率特征 [Batch, 16]
         var_right_0_pool = torch.sum(var_right_0, dim=-1)
         var_right_1_pool = torch.sum(var_right_1, dim=-1)
-        var_right_global = self.layer_right_dropout(torch.cat([var_right_0_pool, var_right_1_pool], dim=1)) # [Batch, 32]
+        var_right_global = self.layer_right_dropout(torch.cat([var_right_0_pool, var_right_1_pool], dim=1))
         
-        # 【特征广播】：将全局频率特征复制 150 份，对齐左支路的时间步
-        time_steps = var_left.size(2) # 获取时间步长 (150)
-        var_right = var_right_global.unsqueeze(-1).expand(-1, -1, time_steps) # [Batch, 32, 150]
+        time_steps = var_left.size(2) 
+        var_right = var_right_global.unsqueeze(-1).expand(-1, -1, time_steps) 
         
-        # --- Project (融合与维度转换) ---
-        # 1. 拼接 Left(时域) 和 Right(全局频域): [Batch, 288, 150]
+        # --- Project ---
         var_combined = torch.cat([var_left, var_right], dim=1)
-        
-        # 2. 转置为序列格式: [Batch, 150, 288] (符合 nn.Linear 的输入规范)
         var_combined = torch.permute(var_combined, (0, 2, 1))
         
-        # 3. 细粒度投影：对每一个时间步独立映射 -> [Batch, 150, 512]
-        projected = self.projection(var_combined)
+        projected = self.projection(var_combined) # [Batch, 150, 512]
         
+        # 【新增】：仅在请求返回 logits 时执行分类
+        if return_logits and self.num_classes is not None:
+            global_feat = torch.mean(projected, dim=1) # 全局池化 [Batch, 512]
+            logits = self.classifier(global_feat)
+            return projected, logits
+            
         return projected

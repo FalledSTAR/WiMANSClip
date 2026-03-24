@@ -54,13 +54,14 @@ def main():
     print(f"数据划分比例   | 训练集: {train_size} (80%) | 验证集: {val_size} (20%)")
     print("="*40 + "\n")
     # ---------------------------------------------------------
-    train_loader = DataLoader(train_dataset, batch_size=cfg['train']['batch_size'], shuffle=True, num_workers=cfg['train']['num_workers'], drop_last=False)
+    train_loader = DataLoader(train_dataset, batch_size=cfg['train']['batch_size'], shuffle=True, num_workers=cfg['train']['num_workers'], drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=cfg['train']['batch_size'], shuffle=False, num_workers=cfg['train']['num_workers'], drop_last=False)
 
     # 3. 初始化模型与优化器
     model = WiMANS_CLIP(
         projection_dim=cfg['model']['projection_dim'],
-        init_temperature=cfg['model']['init_temperature']
+        init_temperature=cfg['model']['init_temperature'],
+        num_classes=9  # 传入分类数
     ).to(device)
     
     criterion = CLIPLoss().to(device)
