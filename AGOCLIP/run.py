@@ -1,10 +1,9 @@
 import os
 import sys
 import yaml
-import copy
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from datetime import datetime
 
 from dataset.wimans_dataset import WiMANS_CLIP_Dataset
@@ -32,7 +31,6 @@ def main():
     exp_dir = f"../result/clip/ago_{timestamp}"
     os.makedirs(exp_dir, exist_ok=True)
     
-    # 立即重定向日志到该文件夹下
     sys.stdout = Logger(os.path.join(exp_dir, "training_log.txt"))
     
     print(f"========== 实验初始化 ==========")
@@ -46,54 +44,53 @@ def main():
     with open(config_path, 'r') as f:
         base_cfg = yaml.safe_load(f)
 
-    # 强制将模型的保存目录重定向到当前的专属文件夹
     base_cfg['train']['save_dir'] = exp_dir
 
     print("\n--- 实验配置参数 (Configuration) ---")
     yaml.dump(base_cfg, sys.stdout, default_flow_style=False, allow_unicode=True)
     print("-----------------------------------")
     
-    # 备份 config.yaml 文件到实验目录，确保随时可复现
     with open(os.path.join(exp_dir, "config_backup.yaml"), "w", encoding="utf-8") as f:
         yaml.dump(base_cfg, f, default_flow_style=False, allow_unicode=True)
 
     # =========================================================
-    # 3. 基础环境与随机种子
+    # 3. 基础环境与全局随机种子
     # =========================================================
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nUsing device: {device}")
 
     seed = base_cfg['train']['seed']
     torch.manual_seed(seed)
+    
+    # 构建专门用于数据集划分的 Generator，确保绝对可复现
+    generator = torch.Generator().manual_seed(seed)
 
     # =========================================================
-    # 4. 数据集场景隔离与划分记录
+    # 4. 数据集加载与随机划分 (由配置文件控制场景)
     # =========================================================
-    train_cfg = copy.deepcopy(base_cfg)
-    val_cfg = copy.deepcopy(base_cfg)
+    full_dataset = WiMANS_CLIP_Dataset(base_cfg)
+    
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    
+    # 恢复 80/20 随机打乱划分
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
 
-    # 【可以在这里动态修改场景配置】
-    train_envs = ['classroom', 'meeting_room']
-    val_envs = ['empty_room']
-    train_cfg['data']['environments'] = train_envs
-    val_cfg['data']['environments'] = val_envs
-
-    train_dataset = WiMANS_CLIP_Dataset(train_cfg)
-    val_dataset = WiMANS_CLIP_Dataset(val_cfg)
+    loaded_envs = base_cfg['data'].get('environments', 'All')
 
     print("\n" + "="*45)
-    print("数据划分记录 (Data Split Record):")
-    print(f"  - 训练集场景 (Train Envs): {train_envs}")
-    print(f"  - 验证集场景 (Val Envs):   {val_envs}")
-    print(f"  - 数据划分规模 | 训练集: {len(train_dataset)} | 验证集: {len(val_dataset)}")
+    print("数据加载与划分记录 (Data Split Record):")
+    print(f"  - 当前加载的场景 (Envs from Config): {loaded_envs}")
+    print(f"  - 总样本数 (Total Samples): {len(full_dataset)}")
+    print(f"  - 数据划分比例 | 训练集: {train_size} (80%) | 验证集: {val_size} (20%)")
     print("="*45 + "\n")
 
     # =========================================================
-    # 5. 构建 DataLoader (切记 train_loader 要 drop_last=True)
+    # 5. 构建 DataLoader (train_loader 保持 drop_last=True)
     # =========================================================
-    train_loader = DataLoader(train_dataset, batch_size=base_cfg['train']['batch_size'], 
+    train_loader = DataLoader(train_dataset, batch_size=base_cfg['train']['batch_size'], pin_memory=True,
                               shuffle=True, num_workers=base_cfg['train']['num_workers'], drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=base_cfg['train']['batch_size'], 
+    val_loader = DataLoader(val_dataset, batch_size=base_cfg['train']['batch_size'], pin_memory=True,
                             shuffle=False, num_workers=base_cfg['train']['num_workers'], drop_last=False)
 
     # =========================================================
@@ -102,15 +99,12 @@ def main():
     model = WiMANS_CLIP(
         projection_dim=base_cfg['model']['projection_dim'],
         init_temperature=base_cfg['model']['init_temperature'],
-        num_classes=9
+        num_classes=10
     ).to(device)
     
     criterion = CLIPLoss().to(device)
     optimizer = optim.Adam(model.parameters(), lr=base_cfg['train']['learning_rate'])
 
-    # =========================================================
-    # 7. 启动训练
-    # =========================================================
     print("=== 开始训练 ===")
     train_loop(model, train_loader, val_loader, criterion, optimizer, base_cfg, device)
 

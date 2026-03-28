@@ -1,7 +1,7 @@
 import os
 import torch
 from datetime import datetime  
-from core.evaluate import evaluate_retrieval
+from core.evaluate import evaluate_retrieval, evaluate_classification
 
 def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, device):
     epochs = cfg['train']['epochs']
@@ -47,16 +47,16 @@ def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, devic
             video_inputs = batch["video"].to(device)
             wifi_inputs = batch["wifi"].to(device)
             
+            # 此时的 action_labels [B, 6, 9] 已经是按物理位置 a~f 排列好的矩阵
             action_labels = batch["label"].to(device) 
-            scene_labels = torch.clamp(torch.sum(action_labels, dim=1), max=1.0)
             
-            video_features, wifi_features, logit_scale, wifi_logits = model(
+            # 获取全局对齐特征 (global) 和局部多坑位分类输出 (logits)
+            video_global, wifi_global, logit_scale, wifi_logits = model(
                 video_inputs, wifi_inputs, return_logits=True
             )
             
-            # 此处 criterion 会自动应用上方更新的 ce_weight
             loss, loss_nce, loss_ce = criterion(
-                video_features, wifi_features, logit_scale, wifi_logits, scene_labels
+                video_global, wifi_global, logit_scale, wifi_logits, action_labels
             )
             
             loss = loss / accumulation_steps
@@ -86,6 +86,12 @@ def train_loop(model, train_loader, val_loader, criterion, optimizer, cfg, devic
         print(f"[{current_time}] Retrieval - V2W R@1: {retrieval_metrics['V2W_R1']:.4f}, W2V R@1: {retrieval_metrics['W2V_R1']:.4f}")
         print(f"[{current_time}] Retrieval - V2W R@5: {retrieval_metrics['V2W_R5']:.4f}, W2V R@5: {retrieval_metrics['W2V_R5']:.4f}")
 
+        # ================= 【新增】：分类验证与日志保存 =================
+        # 传入当前 epoch 和 save_dir，以便将 txt 文件保存到对应的实验目录下
+        val_accuracy = evaluate_classification(model, val_loader, device, epoch + 1, cfg['train']['save_dir'])
+        print(f"[{current_time}] Classification - 6 槽位全局准确率: {val_accuracy * 100:.2f}%")
+        print(f"[{current_time}] -> 预测对比日志已保存至: predictions/epoch_{epoch+1}_val_predictions.txt")
+        
         current_v2w = retrieval_metrics['V2W_R1']
         current_w2v = retrieval_metrics['W2V_R1']
 

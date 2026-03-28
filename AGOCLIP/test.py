@@ -49,7 +49,7 @@ def main():
     model = WiMANS_CLIP(
         projection_dim=cfg['model']['projection_dim'],
         init_temperature=cfg['model']['init_temperature'],
-        num_classes=9
+        num_classes=10
     ).to(device)
     
     weight_path = cfg['test']['weight_path']
