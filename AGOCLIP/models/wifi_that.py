@@ -58,8 +58,22 @@ class THAT_EncoderLayer(nn.Module):
         var_s = torch.permute(var_s, (0, 2, 1))
         return var_s + var_t
 
+class SlotAttentionModule(nn.Module):
+    def __init__(self, dim, num_slots=6, num_heads=8):
+        super().__init__()
+        self.num_slots = num_slots
+        self.query_embed = nn.Parameter(torch.randn(1, num_slots, dim))
+        nn.init.xavier_uniform_(self.query_embed)
+        self.mha = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        B = x.size(0)
+        q = self.query_embed.expand(B, -1, -1)
+        slots, _ = self.mha(q, x, x)
+        return self.norm(slots)
+
 class THAT_Encoder(nn.Module):
-    # 【新增参数】：num_classes (分类数)，如果提供则初始化分类头
     def __init__(self, projection_dim=512, time_steps=3000, features=270, num_classes=None):
         super(THAT_Encoder, self).__init__()
         # ------------------- Left Branch -------------------
@@ -84,9 +98,10 @@ class THAT_Encoder(nn.Module):
         self.layer_leakyrelu = nn.LeakyReLU()
         
         # 投影到联合空间
+        # 【架构】：引入 Slot Attention
+        self.slot_attention = SlotAttentionModule(dim=288, num_slots=6, num_heads=8)
         self.projection = nn.Linear(288, projection_dim)
         
-        # 【新增】：辅助分类头 (Auxiliary Classification Head)
         self.num_classes = num_classes
         if self.num_classes is not None:
             self.classifier = nn.Linear(projection_dim, num_classes)
@@ -97,7 +112,6 @@ class THAT_Encoder(nn.Module):
             
         var_t = x
         
-        # --- Left ---
         var_left = torch.permute(var_t, (0, 2, 1))
         var_left = self.layer_left_pooling(var_left)
         var_left = torch.permute(var_left, (0, 2, 1))
@@ -110,7 +124,6 @@ class THAT_Encoder(nn.Module):
         var_left_1 = self.layer_leakyrelu(self.layer_left_cnn_1(var_left))
         var_left = self.layer_left_dropout(torch.cat([var_left_0, var_left_1], dim=1))
         
-        # --- Right ---
         var_right = torch.permute(var_t, (0, 2, 1))
         var_right = self.layer_right_pooling(var_right)
         for layer in self.layer_right_encoder: var_right = layer(var_right)
@@ -127,16 +140,18 @@ class THAT_Encoder(nn.Module):
         time_steps = var_left.size(2) 
         var_right = var_right_global.unsqueeze(-1).expand(-1, -1, time_steps) 
         
-        # --- Project ---
         var_combined = torch.cat([var_left, var_right], dim=1)
         var_combined = torch.permute(var_combined, (0, 2, 1))
         
-        projected = self.projection(var_combined) # [Batch, 150, 512]
+        # 提取 6 个独立槽位 (对应位置 a~f)
+        slots = self.slot_attention(var_combined)              # [B, 6, 288]
+        projected_slots = self.projection(slots)               # [B, 6, 512]
         
-        # 【新增】：仅在请求返回 logits 时执行分类
         if return_logits and self.num_classes is not None:
-            global_feat = torch.mean(projected, dim=1) # 全局池化 [Batch, 512]
-            logits = self.classifier(global_feat)
-            return projected, logits
+            # 局部特征：直接用 6 个槽位做位置绑定的分类
+            logits = self.classifier(projected_slots)          # [B, 6, 10]
+            # 【修改】：不再内部求均值，把 6 个槽位的特征原封不动返回给 loss 去处理
+            return projected_slots, logits
             
-        return projected
+        # 测试时默认返回全局均值用于特征提取
+        return torch.mean(projected_slots, dim=1)

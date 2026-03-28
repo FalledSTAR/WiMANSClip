@@ -12,144 +12,171 @@ def _now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 @torch.no_grad()
-def evaluate_retrieval(model, dataloader, device):
-    """跨模态检索评估 (细粒度序列对齐版)"""
-    model.eval()
-    all_video_features, all_wifi_features = [], []
-    
-    for batch in dataloader:
-        video_inputs = batch["video"].to(device)
-        wifi_inputs = batch["wifi"].to(device)
-        
-        video_features, wifi_features, _ = model(video_inputs, wifi_inputs)
-        all_video_features.append(video_features)
-        all_wifi_features.append(wifi_features)
-        
-    V = torch.cat(all_video_features, dim=0)
-    W = torch.cat(all_wifi_features, dim=0)
-    N_samples = V.shape[0]
-
-    sim = torch.einsum('imd,jnd->ijmn', V, W)
-    
-    sim_v2w, _ = sim.max(dim=3)     
-    sim_v2w = sim_v2w.mean(dim=2)   
-    
-    sim_w2v, _ = sim.max(dim=2)     
-    sim_w2v = sim_w2v.mean(dim=2)   
-    
-    similarity = (sim_v2w + sim_w2v) / 2.0 
-
-    def calculate_recall(sim_matrix, k=1):
-        _, topk_indices = sim_matrix.topk(k, dim=1)
-        ground_truth = torch.arange(N_samples, device=device).view(-1, 1)
-        correct = (topk_indices == ground_truth).sum().item()
-        return correct / N_samples
-
-    return {
-        "V2W_R1": calculate_recall(similarity, k=1),
-        "V2W_R5": calculate_recall(similarity, k=5),
-        "W2V_R1": calculate_recall(similarity.T, k=1),
-        "W2V_R5": calculate_recall(similarity.T, k=5)
-    }
-
-def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=54, epochs=80):
+def evaluate_retrieval(model, val_loader, device):
     """
-    WiFi 单模态端到端微调 
-    (引入预提取特征缓存技术与监督级匈牙利匹配)
+    使用全局特征 [Batch, 512] 进行跨模态检索评估
+    """
+    model.eval()
+    
+    all_video_features = []
+    all_wifi_features = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            video_inputs = batch["video"].to(device)
+            wifi_inputs = batch["wifi"].to(device)
+
+            # 获取特征，当前模型默认返回的是 video_features, wifi_features, logit_scale
+            video_features, wifi_features, _ = model(video_inputs, wifi_inputs)
+
+            # 【修复点】：如果在测试阶段 video 仍为 3D 序列特征，将其全局池化为 [Batch, 512]
+            if video_features.dim() == 3:
+                video_features = video_features.mean(dim=1)
+                
+            # 确保 WiFi 也是 [Batch, 512] (在 wifi_that.py 中我们在测试模式已默认做过了，这里加一层保险)
+            if wifi_features.dim() == 3:
+                wifi_features = wifi_features.mean(dim=1)
+
+            all_video_features.append(video_features.cpu())
+            all_wifi_features.append(wifi_features.cpu())
+
+    # 拼接所有批次的特征
+    V = torch.cat(all_video_features, dim=0)  # [N, 512]
+    W = torch.cat(all_wifi_features, dim=0)   # [N, 512]
+
+    # L2 归一化
+    V = F.normalize(V, p=2, dim=-1)
+    W = F.normalize(W, p=2, dim=-1)
+
+    # 【核心修复】：直接使用二维矩阵乘法计算全局相似度矩阵
+    sim_matrix = V @ W.t()  # 形状为 [N, N]
+
+    metrics = {}
+    N = sim_matrix.shape[0]
+
+    # ========== Video 检索 WiFi (V2W) ==========
+    v2w_ranks = torch.argsort(sim_matrix, dim=1, descending=True)
+    # R@1
+    v2w_r1 = (v2w_ranks[:, 0] == torch.arange(N)).float().mean().item()
+    # R@5
+    v2w_r5_correct = 0
+    for i in range(N):
+        if i in v2w_ranks[i, :5]:
+            v2w_r5_correct += 1
+    v2w_r5 = v2w_r5_correct / N
+
+    # ========== WiFi 检索 Video (W2V) ==========
+    w2v_sim = sim_matrix.t()
+    w2v_ranks = torch.argsort(w2v_sim, dim=1, descending=True)
+    # R@1
+    w2v_r1 = (w2v_ranks[:, 0] == torch.arange(N)).float().mean().item()
+    # R@5
+    w2v_r5_correct = 0
+    for i in range(N):
+        if i in w2v_ranks[i, :5]:
+            w2v_r5_correct += 1
+    w2v_r5 = w2v_r5_correct / N
+
+    metrics['V2W_R1'] = v2w_r1
+    metrics['V2W_R5'] = v2w_r5
+    metrics['W2V_R1'] = w2v_r1
+    metrics['W2V_R5'] = w2v_r5
+
+    return metrics
+
+def save_slot_predictions(sample_ids, logits, labels, epoch, save_dir):
+    """
+    将基于位置 (a-f) 的 10 分类预测结果与真值对比保存到 txt 文件中
+    """
+    idx_to_class = {
+        0: 'nan', 1: 'nothing', 2: 'walk', 3: 'rotation',
+        4: 'jump', 5: 'wave', 6: 'lie_down', 7: 'pick_up',
+        8: 'sit_down', 9: 'stand_up'
+    }
+    loc_names = ['a', 'b', 'c', 'd', 'e', 'f']
+
+    preds = torch.argmax(logits, dim=-1)
+    gts = torch.argmax(labels, dim=-1)
+
+    pred_dir = os.path.join(save_dir, "predictions")
+    os.makedirs(pred_dir, exist_ok=True)
+    
+    log_file = os.path.join(pred_dir, f"epoch_{epoch}_val_predictions.txt")
+    
+    with open(log_file, "w", encoding="utf-8") as f:
+        for b in range(len(sample_ids)):
+            sample_id = sample_ids[b]
+            f.write(f"Sample: {sample_id}\n")
+            
+            for i in range(6):
+                gt_idx = gts[b, i].item()
+                pred_idx = preds[b, i].item()
+                
+                gt_cls = idx_to_class.get(gt_idx, "UNKNOWN")
+                pred_cls = idx_to_class.get(pred_idx, "UNKNOWN")
+                
+                mark = "✔" if gt_cls == pred_cls else "❌"
+                f.write(f"  Loc {loc_names[i]} | GT: {gt_cls:<8} | Pred: {pred_cls:<8} {mark}\n")
+            f.write("-" * 40 + "\n")
+
+def evaluate_classification(model, val_loader, device, epoch, save_dir):
+    """
+    遍历验证集，计算 6 槽位分类的准确率，并调用保存日志函数
+    """
+    model.eval()
+    correct = 0
+    total = 0
+    
+    all_sample_ids = []
+    all_logits = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in val_loader:
+            sample_ids = batch["sample_id"]
+            video_inputs = batch["video"].to(device)
+            wifi_inputs = batch["wifi"].to(device)
+            labels = batch["label"].to(device) # [B, 6, 10]
+            
+            # 前向传播，获取 6 槽位的 logits
+            _, _, _, wifi_logits = model(video_inputs, wifi_inputs, return_logits=True)
+            
+            # 计算准确率 (6 个位置均参与计算)
+            preds = torch.argmax(wifi_logits, dim=-1)
+            gts = torch.argmax(labels, dim=-1)
+            correct += (preds == gts).sum().item()
+            total += gts.numel()
+
+            all_sample_ids.extend(sample_ids)
+            all_logits.append(wifi_logits.cpu())
+            all_labels.append(labels.cpu())
+
+    # 拼接所有批次的数据并保存日志
+    cat_logits = torch.cat(all_logits, dim=0)
+    cat_labels = torch.cat(all_labels, dim=0)
+    save_slot_predictions(all_sample_ids, cat_logits, cat_labels, epoch, save_dir)
+    
+    accuracy = correct / total if total > 0 else 0.0
+    return accuracy
+
+def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=10, epochs=80):
+    """
+    全新升级：适配 [Batch, 6, 10] 位置锚定架构的线性探测评估
+    彻底废除匈牙利匹配，完美保留所有详细终端辅助信息与日志保存
     """
     print(f"\n[{_now_str()}] [阶段 1/3] 准备极速线性探测 (Fast Linear Probing) 环境...")
     
+    # 冻结骨干网络
     for param in model.wifi_encoder.parameters():
         param.requires_grad = False
         
-    class SlotAttentionClassifier(nn.Module):
-        def __init__(self, in_features, num_users=6, actions_per_user=9):
-            super().__init__()
-            self.num_users = num_users
-            
-            # 6 个吸盘 (身份对称)
-            self.query_embed = nn.Parameter(torch.randn(1, num_users, in_features))
-            self.cross_attn = nn.MultiheadAttention(embed_dim=in_features, num_heads=8, batch_first=True, dropout=0.1)
-            
-            self.norm1 = nn.LayerNorm(in_features)
-            self.norm2 = nn.LayerNorm(in_features)
-            self.ffn = nn.Sequential(
-                nn.Linear(in_features, in_features * 2),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(in_features * 2, in_features)
-            )
-            
-            # ==========================================================
-            # 【神级修复】：废除 6 个独立的脑袋，使用唯一共享的分类头！
-            # 保证所有槽位的分类标准绝对统一，彻底解决过拟合与幻觉！
-            # ==========================================================
-            self.shared_head = nn.Sequential(
-                nn.Linear(in_features, 256),
-                nn.BatchNorm1d(256),
-                nn.ReLU(),
-                nn.Dropout(0.5), # 调高 Dropout，进一步榨干 1500 个样本的泛化潜力
-                nn.Linear(256, actions_per_user)
-            )
-            
-        def forward(self, x):
-            B = x.size(0)
-            queries = self.query_embed.expand(B, -1, -1)
-            
-            # 交叉注意力提取 6 个实例
-            attn_out, _ = self.cross_attn(query=queries, key=x, value=x)
-            out = self.norm1(queries + attn_out)
-            out = self.norm2(out + self.ffn(out)) 
-            
-            # [Batch, 6, 512] -> 平铺 -> [Batch * 6, 512]
-            out_flat = out.view(-1, out.size(-1))
-            
-            # 用唯一的大脑进行分类 -> [Batch * 6, 9]
-            logits_flat = self.shared_head(out_flat)
-            
-            # 恢复形状 -> [Batch, 6, 9]
-            return logits_flat.view(B, self.num_users, -1)
-
-    def match_and_reorder_logits(logits_tensor, labels_tensor):
-        """
-        利用真实标签作为锚点，动态寻找无序槽位的最优排列组合
-        使用 L1 距离 (绝对值误差) 作为代价矩阵，完美解决空槽位匹配问题
-        保留梯度图，确保 BCE Loss 可以正常回传
-        """
-        B, N, C = logits_tensor.shape
-        
-        # 1. 在无梯度环境下，仅仅计算并找出最优对齐索引
-        with torch.no_grad():
-            probs = torch.sigmoid(logits_tensor)
-            batch_indices = []
-            
-            for i in range(B):
-                # 计算 6x6 代价矩阵 (L1 距离)
-                cost_matrix = torch.sum(torch.abs(probs[i].unsqueeze(1) - labels_tensor[i].unsqueeze(0)), dim=-1)
-                cost_matrix_np = cost_matrix.cpu().numpy()
-                row_ind, col_ind = linear_sum_assignment(cost_matrix_np)
-                
-                # col_ind 是标签的顺序 (0~5)。我们需要根据 col_ind 对 row_ind (预测) 进行排序
-                # 这样就能让预测结果严格对齐 0~5 的标签坑位
-                sort_idx = np.argsort(col_ind)
-                aligned_row_ind = row_ind[sort_idx]
-                
-                batch_indices.append(torch.tensor(aligned_row_ind, device=logits_tensor.device))
-                
-            # 堆叠成 [B, 6] 的索引矩阵
-            batch_indices = torch.stack(batch_indices)
-            
-        # 2. 在有梯度的计算图内，使用 gather 算子根据索引重排预测结果
-        # 这样 classifier 就能正常接收反向传播的梯度！
-        indices_expanded = batch_indices.unsqueeze(-1).expand(-1, -1, C)
-        matched_logits = torch.gather(logits_tensor, dim=1, index=indices_expanded)
-            
-        return matched_logits
-
-    classifier = SlotAttentionClassifier(model.wifi_encoder.projection.out_features).to(device)
+    # 【架构简化】：由于 wifi_encoder 已经输出了完美解耦的 6 个槽位特征
+    # 我们不需要复杂的 SharedHead 或 Attention，只需要一个简单的线性探测器
+    classifier = nn.Linear(512, num_classes).to(device)
     optimizer = optim.Adam(classifier.parameters(), lr=1e-3)
-    pos_weight = torch.ones([num_classes]).to(device) * 5.0
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    
+    # 使用交叉熵损失 (CrossEntropyLoss 自动处理 10 分类)
+    criterion = nn.CrossEntropyLoss()
 
     export_dir = "../result/clip/predictions"
     os.makedirs(export_dir, exist_ok=True)
@@ -160,20 +187,14 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
     def _update_topk_prediction_file(score, epoch_idx, file_content):
         """根据综合评分保留前10名结果，文件名仅保留轮次信息"""
         should_save = len(topk_records) < top_k or score > topk_records[-1][0]
-
         if not should_save:
             return
-
-        # 文件名精简：仅使用轮次
         file_name = f"epoch_{epoch_idx+1:02d}.txt"
         file_path = os.path.join(export_dir, file_name)
-
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(file_content)
-
         topk_records.append((score, file_path))
         topk_records.sort(key=lambda x: x[0], reverse=True)
-
         if len(topk_records) > top_k:
             _, path_to_remove = topk_records.pop()
             if os.path.exists(path_to_remove):
@@ -184,31 +205,27 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
     print(f"\n[{_now_str()}] [阶段 2/3] 预提取并缓存骨干网络特征 (只需执行 1 次)...")
     model.wifi_encoder.eval()
     
-    train_feat_list, train_label_list = [], []
-    with torch.no_grad():
-        for batch in train_loader:
-            wifi_inputs = batch["wifi"].to(device)
-            labels = batch["label"].view(-1, num_classes).to(device)
-            raw_feat = model.wifi_encoder(wifi_inputs)
-            train_feat_list.append(raw_feat.cpu())
-            train_label_list.append(labels.cpu())
-            
-    train_dataset_cached = TensorDataset(torch.cat(train_feat_list, dim=0), torch.cat(train_label_list, dim=0))
-    cached_train_loader = DataLoader(train_dataset_cached, batch_size=train_loader.batch_size, shuffle=True)
+    def extract_features(loader):
+        feat_list, label_list, ids_list = [], [], []
+        with torch.no_grad():
+            for batch in loader:
+                wifi_inputs = batch["wifi"].to(device)
+                labels = batch["label"].to(device) # [B, 6, 10]
+                ids_list.extend(batch.get("sample_id", []))
+                
+                # 提取槽位特征 [B, 6, 512]
+                outputs = model.wifi_encoder(wifi_inputs, return_logits=True)
+                raw_feat = outputs[0] if isinstance(outputs, tuple) else outputs
+                
+                feat_list.append(raw_feat.cpu())
+                label_list.append(labels.cpu())
+        return torch.cat(feat_list, dim=0), torch.cat(label_list, dim=0), ids_list
 
-    test_feat_list, test_label_list = [], []
-    all_sample_ids = []
-    with torch.no_grad():
-        for batch in test_loader:
-            wifi_inputs = batch["wifi"].to(device)
-            labels = batch["label"].to(device) 
-            raw_feat = model.wifi_encoder(wifi_inputs)
-            test_feat_list.append(raw_feat.cpu())
-            test_label_list.append(labels.cpu())
-            all_sample_ids.extend(batch["sample_id"])
+    train_feats, train_labels, _ = extract_features(train_loader)
+    test_feats, test_labels, all_sample_ids = extract_features(test_loader)
             
-    test_dataset_cached = TensorDataset(torch.cat(test_feat_list, dim=0), torch.cat(test_label_list, dim=0))
-    cached_test_loader = DataLoader(test_dataset_cached, batch_size=test_loader.batch_size, shuffle=False)
+    cached_train_loader = DataLoader(TensorDataset(train_feats, train_labels), batch_size=train_loader.batch_size, shuffle=True)
+    cached_test_loader = DataLoader(TensorDataset(test_feats, test_labels), batch_size=test_loader.batch_size, shuffle=False)
     
     print(f"\n[{_now_str()}] [阶段 3/3] 启动全速微调 (总 Epochs: {epochs})...")
     log_interval = 20
@@ -218,16 +235,19 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
         total_train_loss = 0.0
         
         for i, (cached_feat, labels) in enumerate(cached_train_loader):
-            cached_feat = cached_feat.to(device)
-            labels = labels.view(-1, 6, 9).to(device)
+            cached_feat = cached_feat.to(device) # [B, 6, 512]
+            labels = labels.to(device)           # [B, 6, 10]
+            
+            # 【核心修改】：平铺特征去训练唯一的线性层
+            feats_flat = cached_feat.view(-1, 512)
+            # 获取真实的 10 分类标签索引 (0~9)
+            lbls_idx = torch.argmax(labels, dim=-1).view(-1)
             
             optimizer.zero_grad()
-            logits = classifier(cached_feat)
-            logits = logits.view(-1, 6, 9)
+            logits_flat = classifier(feats_flat) # [B*6, 10]
             
-            matched_logits = match_and_reorder_logits(logits, labels)
-            
-            loss = criterion(matched_logits.view(-1, 54), labels.view(-1, 54))
+            # 直接计算 CE Loss，不再需要匈牙利重排
+            loss = criterion(logits_flat, lbls_idx)
             loss.backward()
             optimizer.step()
             
@@ -238,32 +258,29 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
                 
         avg_loss = total_train_loss / len(cached_train_loader)
         
+        # =========================================================
+        # 核心评估：保留你所有的细粒度统计指标
+        # =========================================================
         classifier.eval()
-        all_preds_logits, all_labels = [], []
+        all_preds, all_gts = [], []
         
         with torch.no_grad():
             for cached_feat, labels in cached_test_loader:
                 cached_feat = cached_feat.to(device)
-                labels = labels.view(-1, 6, 9).to(device)
+                logits = classifier(cached_feat) # [B, 6, 10]
                 
-                logits = classifier(cached_feat)      
-                logits = logits.view(-1, 6, 9)     
+                preds_idx = torch.argmax(logits, dim=-1) # [B, 6]
+                gts_idx = torch.argmax(labels.to(device), dim=-1) # [B, 6]
                 
-                matched_logits = match_and_reorder_logits(logits, labels)
+                all_preds.append(preds_idx.cpu())
+                all_gts.append(gts_idx.cpu())
                 
-                all_preds_logits.append(matched_logits.cpu())
-                all_labels.append(labels.cpu())
-                
-        full_logits = torch.cat(all_preds_logits, dim=0) 
-        full_labels = torch.cat(all_labels, dim=0)       
-        
-        probs = torch.sigmoid(full_logits) 
-        max_probs, pred_indices = torch.max(probs, dim=2) 
-        
-        pred_argmax_onehot = torch.zeros_like(full_logits)
-        pred_argmax_onehot.scatter_(2, pred_indices.unsqueeze(-1), 1)
-        valid_mask = max_probs > 0.5 
-        pred_onehot = pred_argmax_onehot * valid_mask.unsqueeze(-1).float()
+        full_preds = torch.cat(all_preds, dim=0) # [N, 6]
+        full_gts = torch.cat(all_gts, dim=0)     # [N, 6]
+
+        # 还原回 10 维 one-hot 格式，以兼容你的 txt 文件写入逻辑
+        pred_onehot_int = F.one_hot(full_preds, num_classes=10).int()
+        full_labels_int = F.one_hot(full_gts, num_classes=10).int()
         
         if epoch == 0:
             gt_path = os.path.join(export_dir, "ground_truth.txt")
@@ -273,33 +290,28 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
                 for idx, s_id in enumerate(all_sample_ids):
                     f.write(f"Sample: {s_id}\n")
                     for u in range(6):
-                        f.write(f"  User_{u+1}: {full_labels[idx, u].int().tolist()}\n")
+                        f.write(f"  User_{u+1}: {full_labels_int[idx, u].tolist()}\n")
                     f.write("\n")
 
-        pred_flat = pred_onehot.view(-1, 9)
-        labels_flat = full_labels.view(-1, 9)
+        # 【指标掩码计算】: 索引 0是nan, 1是nothing。 大于 1 (2~9) 才是真实的 action
+        correct_matrix = (full_preds == full_gts) # [N, 6]
+        active_mask = full_gts > 1                # 真实存在动作的槽位
+        empty_mask = full_gts <= 1                # 静默或无人槽位 (nan/nothing)
         
-        correct_all = (pred_flat == labels_flat).all(dim=1)
-        active_mask = labels_flat.sum(dim=1) > 0   
-        empty_mask = ~active_mask                  
-        
-        acc_active = correct_all[active_mask].sum().item() / active_mask.sum().item() if active_mask.sum().item() > 0 else 0.0
-        acc_empty = correct_all[empty_mask].sum().item() / empty_mask.sum().item() if empty_mask.sum().item() > 0 else 0.0
-        acc_total = correct_all.sum().item() / labels_flat.size(0)
+        acc_active = correct_matrix[active_mask].float().mean().item() if active_mask.sum().item() > 0 else 0.0
+        acc_empty = correct_matrix[empty_mask].float().mean().item() if empty_mask.sum().item() > 0 else 0.0
+        acc_total = correct_matrix.float().mean().item()
 
-        room_labels = full_labels.sum(dim=1) > 0 
-        room_preds = pred_onehot.sum(dim=1) > 0 
-        room_active_mask = room_labels.sum(dim=1) > 0 
-        room_recall = ((room_preds == room_labels).all(dim=1)[room_active_mask].sum().item() / room_active_mask.sum().item()) if room_active_mask.sum().item() > 0 else 0.0
+        # 房间级命中率 (6个槽位全部预测正确，且该房间必须有真实动作)
+        room_correct = correct_matrix.all(dim=1)
+        room_active_mask = active_mask.any(dim=1)
+        room_recall = room_correct[room_active_mask].float().mean().item() if room_active_mask.sum().item() > 0 else 0.0
 
-        # === 核心修改：三项指标的均值计算 ===
         comprehensive_score = (acc_total + acc_active + acc_empty) / 3.0
 
-        pred_onehot_int = pred_onehot.int()
-        full_labels_int = full_labels.int()
-
+        # ========== 构建你熟悉的文本日志 ==========
         prediction_lines = []
-        prediction_lines.append(f"Epoch {epoch+1:02d} 预测结果 (Threshold-Gated Argmax)")
+        prediction_lines.append(f"Epoch {epoch+1:02d} 预测结果 (10分类位置锚定)")
         prediction_lines.append(f"当前综合得分 (Score): {comprehensive_score:.4f}")
         prediction_lines.append(f"  - 全局总准确率: {acc_total:.4f}")
         prediction_lines.append(f"  - 真实动作准确率: {acc_active:.4f}")
@@ -307,35 +319,37 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
         prediction_lines.append("-" * 70)
         
         for idx, s_id in enumerate(all_sample_ids):
-            sample_correct = bool((pred_onehot_int[idx] == full_labels_int[idx]).all().item())
+            sample_correct = bool(correct_matrix[idx].all().item())
             sample_status = "✔" if sample_correct else "❌"
             prediction_lines.append(f"Sample: {s_id} | SampleCorrect: {sample_status}")
             
             for u in range(6):
-                user_correct = bool((pred_onehot_int[idx, u] == full_labels_int[idx, u]).all().item())
+                user_correct = bool(correct_matrix[idx, u].item())
                 user_status = "✔" if user_correct else "❌"
-                gt_active = int(full_labels_int[idx, u].sum().item() > 0)
-                pred_active = int(pred_onehot_int[idx, u].sum().item() > 0)
+                gt_active = 1 if full_gts[idx, u].item() > 1 else 0
+                pred_active = 1 if full_preds[idx, u].item() > 1 else 0
+                
                 prediction_lines.append(
-                    f"  User_{u+1} | Correct: {user_status} | GT_Active: {gt_active} | Pred_Active: {pred_active}"
+                    f"  Loc_{u+1} | Correct: {user_status} | GT_Active: {gt_active} | Pred_Active: {pred_active}"
                 )
                 prediction_lines.append(f"    GT  : {full_labels_int[idx, u].tolist()}")
                 prediction_lines.append(f"    Pred: {pred_onehot_int[idx, u].tolist()}")
             prediction_lines.append("")
 
         prediction_content = "\n".join(prediction_lines)
-        
         _update_topk_prediction_file(comprehensive_score, epoch, prediction_content)
 
-        total_test_samples = full_labels.size(0)
-        total_slots = labels_flat.size(0)
+        # ========== 恢复详细统计数据台账 ==========
+        total_test_samples = full_gts.size(0)
+        total_slots = total_test_samples * 6
         active_slots = int(active_mask.sum().item())
         empty_slots = int(empty_mask.sum().item())
-        sample_has_action_mask = full_labels.view(total_test_samples, -1).sum(dim=1) > 0
-        active_samples = int(sample_has_action_mask.sum().item())
-        zero_user_samples = int((~sample_has_action_mask).sum().item())
+        
+        active_samples = int(room_active_mask.sum().item())
+        zero_user_samples = int((full_gts == 0).all(dim=1).sum().item())
         empty_slots_from_zero_user_samples = zero_user_samples * 6
         empty_slots_from_partial_absent_users = max(empty_slots - empty_slots_from_zero_user_samples, 0)
+        
         final_eval_stats = {
             "total_test_samples": total_test_samples,
             "total_slots": total_slots,
@@ -354,16 +368,16 @@ def evaluate_linear_probe(model, train_loader, test_loader, device, num_classes=
               f"静默抑制准确率: {acc_empty * 100:.2f}% | "
               f"房间级命中率: {room_recall * 100:.2f}%\n")
 
+    # 训练结束后打印最终台账
     if final_eval_stats is not None:
         print(f"[{_now_str()}] [评估样本统计] 总测试样本数: {final_eval_stats['total_test_samples']}")
         print(f"[{_now_str()}] [评估样本统计] 槽位总数(测试样本数*6): {final_eval_stats['total_slots']}")
-        print(f"[{_now_str()}] [评估样本统计] 真实有动作槽位数(active slots): {final_eval_stats['active_slots']}")
-        print(f"[{_now_str()}] [评估样本统计] 全0槽位数(empty slots): {final_eval_stats['empty_slots']}")
+        print(f"[{_now_str()}] [评估样本统计] 真实有动作槽位数(>1): {final_eval_stats['active_slots']}")
+        print(f"[{_now_str()}] [评估样本统计] 空置/静默槽位数(<=1): {final_eval_stats['empty_slots']}")
         print(f"[{_now_str()}] [评估样本统计] 含动作样本数(至少1个用户有动作): {final_eval_stats['active_samples']}")
-        print(f"[{_now_str()}] [评估样本统计] 0用户样本数(全用户全动作为0): {final_eval_stats['zero_user_samples']}")
-        print(f"[{_now_str()}] [评估样本统计] 来自0用户样本的全0槽位数: {final_eval_stats['empty_slots_from_zero_user_samples']}")
-        print(f"[{_now_str()}] [评估样本统计] 来自非0用户样本的全0槽位数: {final_eval_stats['empty_slots_from_partial_absent_users']}")
-
+        print(f"[{_now_str()}] [评估样本统计] 0用户空房间样本数: {final_eval_stats['zero_user_samples']}")
+        print(f"[{_now_str()}] [评估样本统计] 来自空房间的纯静默槽位数: {final_eval_stats['empty_slots_from_zero_user_samples']}")
+        print(f"[{_now_str()}] [评估样本统计] 来自非空房间的无动作槽位数: {final_eval_stats['empty_slots_from_partial_absent_users']}")
         print(f"[{_now_str()}] [Top-{top_k} 保存] 预测结果已保存轮次: {len(topk_records)}")
     
     return comprehensive_score
